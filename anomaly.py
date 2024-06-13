@@ -1,162 +1,107 @@
-import numpy as np
-import pandas as pd
-from typing import Tuple
+from typing import List, Tuple
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import train_test_split
-from functools import reduce
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+import pandas as pd
+import numpy as np
 
-class Net(nn.Module):
-    # Dense Neural Network for Anomaly Detection
-    def __init__(self, input_dim) -> None:
-        super(Net, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 200)
-        self.fc2 = nn.Linear(200, 1)
+# Define your LSTMNet model for anomaly detection
+class LSTMNet(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int) -> None:
+        super(LSTMNet, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.relu(self.fc1(x))
-        x = torch.sigmoid(self.fc2(x))
-        return x
+        x = x.unsqueeze(1)
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
+        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_dim).to(x.device)
+        out, _ = self.lstm(x, (h0, c0))
+        out = self.fc(out[:, -1, :])
+        out = torch.sigmoid(out)
+        return out
 
-def load_data(csv_path: str, which_cell: int = 0, window_len: int = 96) -> tuple:
-    dataset_train = pd.read_csv(csv_path)
-    train_data = dataset_train.values
+def preprocess_name(name: str) -> int:
+    return int(name[1:])
 
-    # Initialise arrays to store anomaly and load data
-    anomaly_data = np.zeros((5, 3, 5, 16608))
-    load_data = np.zeros((5, 3, 5, 16608))
+def partition_data(df, num_clients):
+    dfs = np.array_split(df, num_clients)
+    return dfs
 
-    # Splitting the dataset into cell-, category-, and device-specific data
-    for cell in range(5):
-       for category in range(3):
-           for device in range(5):
-               rows = reduce(np.intersect1d, (np.where(train_data[:, 1] == cell),
-                                           np.where(train_data[:, 2] == category),
-                                           np.where(train_data[:, 3] == device)))
-               if rows.size > 0:
-                    load_data[cell, category, device] = train_data[rows, 2]  
-                    anomaly_data[cell, category, device] = train_data[rows, 9]  
+def load_data(csv_path: str, num_clients: int, test_size: float = 0.2, random_state: int = 42, portion: float = 0.1) -> List[Tuple[DataLoader, DataLoader]]:
+    df = pd.read_csv(csv_path)
 
-    # Aggregate load and anomaly data for the selected cell
-    load_set = np.sum(np.sum(load_data[which_cell, :, :, :], axis=0), axis=0)
-    anomaly_set = np.sum(np.sum(anomaly_data[which_cell, :, :, :], axis=0), axis=0)
-    anomaly_set[anomaly_set != 0] = 1
+    if df.isnull().sum().sum() > 0:
+        print("Missing values found. Handling missing values...")
+        df.fillna(df.median(), inplace=True)
 
-    sc = MinMaxScaler(feature_range=(0, 1))
-    load_set_scaled = sc.fit_transform(load_set.reshape(-1, 1))
+    dfs = partition_data(df, num_clients)
 
-    X, y = [], []
-    for i in range(window_len, len(load_set_scaled)):
-        X.append(load_set_scaled[i-window_len:i, 0])
-        y.append(anomaly_set[i])
-    X, y = np.array(X), np.array(y)
+    train_loaders = []
+    test_loaders = []
 
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    for i in range(num_clients):
+        if portion < 1.0:
+            df_sampled = dfs[i].sample(frac=portion, random_state=random_state)
+        else:
+            df_sampled = dfs[i]
 
-    train_dataset = TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train))
-    test_dataset = TensorDataset(torch.FloatTensor(X_test), torch.FloatTensor(y_test))
+        X = df_sampled.drop(columns=['isFraud'])
+        y = df_sampled['isFraud']
 
-    train_loader = DataLoader(dataset=train_dataset, batch_size=32, shuffle=True)
-    test_loader = DataLoader(dataset=test_dataset, batch_size=32)
+        scaler = MinMaxScaler()
+        X_scaled = scaler.fit_transform(X)
 
-    return train_loader, test_loader
+        X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=test_size, random_state=random_state)
 
-# def load_data(csv_path: str, window_len: int = 96) -> tuple:
-#     dataset_train = pd.read_csv(csv_path)
+        X_train_tensor = torch.FloatTensor(X_train)
+        y_train_tensor = torch.FloatTensor(y_train.to_numpy())
+        X_test_tensor = torch.FloatTensor(X_test)
+        y_test_tensor = torch.FloatTensor(y_test.to_numpy())
 
-#     # Extracting relevant features
-#     features = ['type', 'amount', 'oldbalanceOrig', 'newbalanceOrig', 
-#                 'oldbalanceDest', 'newbalanceDest', 'isFraud']
+        train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+        test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+        train_loader = DataLoader(dataset=train_dataset, batch_size=16, shuffle=True)
+        test_loader = DataLoader(dataset=test_dataset, batch_size=16)
 
-#     # Preprocessing features
-#     data = dataset_train[features]
+        train_loaders.append(train_loader)
+        test_loaders.append(test_loader)
 
-#     # Scaling numerical features
-#     scaler = MinMaxScaler()
-#     scaled_data = scaler.fit_transform(data)
+    # Return a single tuple containing both lists
+    return train_loaders, test_loaders
 
-#     # Splitting features and labels
-#     X = []
-#     y = []
-#     for i in range(window_len, len(scaled_data)):
-#         X.append(scaled_data[i - window_len:i, :-1])  # Exclude the target column (isFraud)
-#         y.append(scaled_data[i, -1])  # Target column (isFraud)
+def create_train_loader(df: pd.DataFrame, test_size: float = 0.2, batch_size: int = 32) -> DataLoader:
+    X = df.drop(columns=['isFraud']).values.astype(np.float32)
+    y = df['isFraud'].values.astype(np.float32)
 
-#     X = np.array(X)
-#     y = np.array(y)
+    X_train, _, y_train, _ = train_test_split(X, y, test_size=test_size, random_state=42)
 
-#     # Splitting data into training and testing sets
-#     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    X_train_tensor = torch.tensor(X_train)
+    y_train_tensor = torch.tensor(y_train)
 
-#     # Creating PyTorch datasets and dataloaders
-#     train_dataset = TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train))
-#     test_dataset = TensorDataset(torch.FloatTensor(X_test), torch.FloatTensor(y_test))
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-#     train_loader = DataLoader(dataset=train_dataset, batch_size=32, shuffle=True)
-#     test_loader = DataLoader(dataset=test_dataset, batch_size=32)
+    return train_loader
 
-#     return train_loader, test_loader
+def create_test_loader(df: pd.DataFrame, test_size: float = 0.2, batch_size: int = 32) -> DataLoader:
+    X = df.drop(columns=['isFraud']).values.astype(np.float32)
+    y = df['isFraud'].values.astype(np.float32)
 
+    _, X_test, _, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
 
-def train(net: Net, trainloader: DataLoader, epochs: int, device: torch.device) -> float:
-    criterion = nn.BCELoss()
-    optimizer = torch.optim.Adam(net.parameters(), lr=0.001)
-    net.to(device)
-    net.train()
-    
-    total_loss = 0
-    for epoch in range(epochs):
-        for inputs, labels in trainloader:
-            inputs, labels = inputs.to(device), labels.to(device).unsqueeze(1)
-            optimizer.zero_grad()
-            outputs = net(inputs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-    average_loss = total_loss / (len(trainloader.dataset) * epochs)
-    return average_loss
+    X_test_tensor = torch.tensor(X_test)
+    y_test_tensor = torch.tensor(y_test)
 
-def test(net: Net, testloader: DataLoader, device: torch.device) -> Tuple[float, float]:
-    criterion = nn.BCELoss()
-    net.eval()
-    
-    total_loss, correct, total = 0.0, 0, 0
-    with torch.no_grad():
-        for inputs, labels in testloader:
-            inputs, labels = inputs.to(device), labels.to(device).unsqueeze(1)
-            outputs = net(inputs)
-            loss = criterion(outputs, labels)
-            total_loss += loss.item()
-            predicted = (outputs > 0.5).float()
-            correct += (predicted == labels).sum().item()
-            total += labels.size(0)
-    average_loss = total_loss / len(testloader.dataset)
-    accuracy = correct / total
-    return average_loss, accuracy
+    test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-def main():
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    csv_path = 'cell_data.csv'
+    return test_loader
 
-    print("Centralized PyTorch training")
-    print("Load data")
-
-    trainloader, testloader = load_data(csv_path)
-    net = Net(input_dim=96).to(DEVICE)
-    net.eval()
-
-    print("Start training")
-    train(net=net, trainloader=trainloader, epochs=100, device=DEVICE)
-
-    print("Evaluate model")
-    loss, accuracy = test(net=net, testloader=testloader, device=DEVICE)
-
-    print("Loss: ", loss)
-    print("Accuracy: ", accuracy)
-
-if __name__ == "__main__":
-    main()
+def disable_progress_bar():
+    import os
+    os.environ['TQDM_DISABLE'] = '1'
