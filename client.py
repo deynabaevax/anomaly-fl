@@ -1,41 +1,337 @@
 import argparse
-import csv
 import os
-from typing import Dict, List, Tuple
-import flwr as fl
-import numpy as np
+import csv
+import glob
 import pandas as pd
-import torch
-from datasets.utils.logging import disable_progress_bar
+import numpy as np
+import flwr as fl
+import matplotlib.pyplot as plt
+from sklearn.ensemble import IsolationForest
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from torch.utils.data import DataLoader
-import torch.nn as nn
-from sklearn.metrics import precision_score, recall_score, f1_score
+from datasets.utils.logging import disable_progress_bar
+from typing import List, Dict, Tuple
 
-# Import AnomalyClient from anomaly module
-from anomaly import LSTMNet, load_data
+from anomaly import load_data
 
 disable_progress_bar()
 
-DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+class AnomalyClient(fl.client.NumPyClient):
+    def __init__(self, isolation_forest_model, trainloader: DataLoader, testloader: DataLoader, client_id) -> None:
+        super().__init__()
+        self.isolation_forest_model = isolation_forest_model
+        self.trainloader = trainloader
+        self.testloader = testloader
+        self.client_id = client_id
+        self.approx_round_number = 1
+
+    def log_metric(self, metric_name, value, client_id):
+        os.makedirs('metrics', exist_ok=True)
+        filename = f"metrics/metrics_client_{client_id}.csv"
+        with open(filename, "a", newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([metric_name, value, client_id, self.approx_round_number])
+
+    def fit(self, parameters: List[np.ndarray], config: Dict[str, str]) -> Tuple[List[np.ndarray], int, Dict]:
+        self.isolation_forest_model.fit(self.trainloader.dataset.tensors[0].numpy())
+        training_labels = self.trainloader.dataset.tensors[1].numpy()
+        if_train_scores = self.isolation_forest_model.decision_function(self.trainloader.dataset.tensors[0].numpy())
+        training_preds = (if_train_scores < 0).astype(int)
+
+        training_loss = 1 - accuracy_score(training_labels, training_preds)
+        accuracy = accuracy_score(training_labels, training_preds)
+        precision = precision_score(training_labels, training_preds)
+        recall = recall_score(training_labels, training_preds)
+        f1 = f1_score(training_labels, training_preds)
+
+        self.log_metric("TRAIN_LOSS", training_loss, self.client_id)
+        self.log_metric("TRAIN_ACCURACY", accuracy, self.client_id)
+        self.log_metric("TRAIN_PRECISION", precision, self.client_id)
+        self.log_metric("TRAIN_RECALL", recall, self.client_id)
+        self.log_metric("TRAIN_F1_SCORE", f1, self.client_id)
+
+        return [], len(self.trainloader.dataset), {
+            "training_loss": training_loss,
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1_score": f1
+        }
+
+    def evaluate(self, parameters: List[np.ndarray], config: Dict[str, str]) -> Tuple[float, int, Dict]:
+        test_labels = self.testloader.dataset.tensors[1].numpy()
+        if_test_scores = self.isolation_forest_model.decision_function(self.testloader.dataset.tensors[0].numpy())
+        test_preds = (if_test_scores < 0).astype(int)
+
+        testing_loss = 1 - accuracy_score(test_labels, test_preds)
+        accuracy = accuracy_score(test_labels, test_preds)
+        precision = precision_score(test_labels, test_preds)
+        recall = recall_score(test_labels, test_preds)
+        f1 = f1_score(test_labels, test_preds)
+
+        metrics = {
+            "testing_loss": testing_loss,
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1_score": f1
+        }
+
+        for metric_name, value in metrics.items():
+            self.log_metric(metric_name.upper(), value, self.client_id)
+
+        self.approx_round_number += 1
+
+        return testing_loss, len(self.testloader.dataset), metrics
+
+
+def aggregate_metrics():
+    all_files = glob.glob('metrics/*.csv')
+    df_list = []
+    for filename in all_files:
+        df = pd.read_csv(filename, names=['Metric', 'Value', 'ClientID', 'Round'])
+        df_list.append(df)
+    return pd.concat(df_list, ignore_index=True)
+
+def plot_metric_per_round(metrics_df, metric_name, title, save_path):
+    filtered_df = metrics_df[metrics_df['Metric'] == metric_name]
+    if filtered_df.empty:
+        print(f"No data found for metric '{metric_name}'")
+        return
+    pivot_df = filtered_df.pivot_table(index='Round', columns='ClientID', values='Value', aggfunc='mean')
+
+    plt.figure(figsize=(10, 6))
+    for column in pivot_df.columns:
+        plt.plot(pivot_df.index, pivot_df[column], marker='o', label=f'Client {column}')
+
+    plt.title(title)
+    plt.xlabel('Federated Round')
+    plt.ylabel(metric_name.replace("_", " ").capitalize())
+    plt.legend(title='Client ID')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+
+def plot_convergence(metrics_df, metric_name, save_path):
+    filtered_df = metrics_df[metrics_df['Metric'] == metric_name]
+    if filtered_df.empty:
+        print(f"No data found for metric '{metric_name}'")
+        return
+    
+    plt.figure(figsize=(10, 6))
+    for client_id in filtered_df['ClientID'].unique():
+        client_data = filtered_df[filtered_df['ClientID'] == client_id]
+        plt.plot(client_data['Round'], client_data['Value'], marker='o', label=f'Client {client_id}')
+    
+    plt.title(f'{metric_name.replace("_", " ").capitalize()} Convergence')
+    plt.xlabel('Federated Round')
+    plt.ylabel(metric_name.replace("_", " ").capitalize())
+    plt.legend(title='Client ID')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    
+def main():
+    parser = argparse.ArgumentParser(description="FL client for anomaly detection")
+    parser.add_argument("--server_address", type=str, default="localhost:8080", help="Server address")
+    parser.add_argument("--client_id", type=int, default=0, help="Client ID")
+    parser.add_argument("--node-id", type=int, required=True, choices=range(0, 5), help="Node ID")
+    args = parser.parse_args()
+
+    num_clients = 5
+    train_loaders, test_loaders = load_data("C:/Users/deyna/Desktop/anomaly-fl-main/data/feat.csv", num_clients=num_clients)
+
+    isolation_forest_model = IsolationForest(contamination=0.1)
+
+    clients = []
+    for client_id in range(num_clients):
+        client = AnomalyClient(isolation_forest_model, train_loaders[client_id], test_loaders[client_id], client_id).to_client()
+        clients.append(client)
+
+    client_ip = "localhost"
+    client_port = "8080"
+    server_address = f"{client_ip}:{client_port}"
+    print(f"Connecting to {server_address}")
+    fl.client.start_client(server_address=server_address, client=clients[args.client_id])
+
+    metrics_df = aggregate_metrics()
+    metrics_df.to_csv("metrics/metrics_aggregated.csv", index=False)
+    print("Metrics DataFrame saved to metrics/metrics_aggregated.csv")
+    print(metrics_df.head())
+
+    plot_metric_per_round(metrics_df, 'TRAIN_ACCURACY', 'Average Training Accuracy per Round', 'metrics/training_accuracy_per_round.png')
+    plot_convergence(metrics_df, 'ACCURACY', 'metrics/accuracy_convergence.png')
+
+if __name__ == "__main__":
+    main()
+    
+
+'''
+# old code
+class AnomalyClient(fl.client.NumPyClient):
+    def __init__(self, isolation_forest_model, trainloader: DataLoader, testloader: DataLoader, client_id) -> None:
+        super().__init__()
+        self.isolation_forest_model = isolation_forest_model
+        self.trainloader = trainloader
+        self.testloader = testloader
+        self.client_id = client_id
+        self.approx_round_number = 1  # Initialize round number for this client instance
+
+    def log_metric(self, metric_name, value):
+        os.makedirs('metrics', exist_ok=True)
+        # Use client_id for unique filename
+        filename = f"metrics/metrics_client_{self.client_id}.csv" 
+        with open(filename, "a", newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([metric_name, value, self.client_id, self.approx_round_number]) 
+
+    def fit(self, parameters: List[np.ndarray], config: Dict[str, str]) -> Tuple[List[np.ndarray], int, Dict]:
+        self.isolation_forest_model.fit(self.trainloader.dataset.tensors[0].numpy())
+        training_labels = self.trainloader.dataset.tensors[1].numpy()
+        if_train_scores = self.isolation_forest_model.decision_function(self.trainloader.dataset.tensors[0].numpy())
+        training_preds = (if_train_scores < 0).astype(int)
+
+        training_loss = 1 - accuracy_score(training_labels, training_preds)
+        accuracy = accuracy_score(training_labels, training_preds)
+        precision = precision_score(training_labels, training_preds)
+        recall = recall_score(training_labels, training_preds)
+        f1 = f1_score(training_labels, training_preds)
+
+        self.log_metric("TRAIN_LOSS", training_loss)
+        self.log_metric("TRAIN_ACCURACY", accuracy)
+        self.log_metric("TRAIN_PRECISION", precision)
+        self.log_metric("TRAIN_RECALL", recall)
+        self.log_metric("TRAIN_F1_SCORE", f1)
+
+        # # Increment round number after each fit
+        # self.approx_round_number += 1
+
+        return [], len(self.trainloader.dataset), {
+            "training_loss": training_loss,
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1_score": f1
+        }
+
+    def evaluate(self, parameters: List[np.ndarray], config: Dict[str, str]) -> Tuple[float, int, Dict]:
+        test_labels = self.testloader.dataset.tensors[1].numpy()
+        if_test_scores = self.isolation_forest_model.decision_function(self.testloader.dataset.tensors[0].numpy())
+        test_preds = (if_test_scores < 0).astype(int)
+
+        testing_loss = 1 - accuracy_score(test_labels, test_preds)
+        accuracy = accuracy_score(test_labels, test_preds)
+        precision = precision_score(test_labels, test_preds)
+        recall = recall_score(test_labels, test_preds)
+        f1 = f1_score(test_labels, test_preds)
+
+        self.log_metric("TESTING_LOSS", testing_loss)
+        self.log_metric("TEST_ACCURACY", accuracy)
+        self.log_metric("TEST_PRECISION", precision)
+        self.log_metric("TEST_RECALL", recall)
+        self.log_metric("TEST_F1_SCORE", f1)
+
+        # Increment round number after each evaluate
+        self.approx_round_number += 1
+
+        return testing_loss, len(self.testloader.dataset), {
+            "testing_loss": testing_loss,
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1_score": f1
+        }
+
+def aggregate_metrics():
+    all_files = glob.glob('metrics/*.csv')
+    df_list = []
+    for filename in all_files:
+        df = pd.read_csv(filename, names=['Metric', 'Value', 'ClientID', 'Round'])
+        df_list.append(df)
+    return pd.concat(df_list, ignore_index=True)
+    
+def plot_metric_per_round(metrics_df, metric_name, title, save_path):
+    filtered_df = metrics_df[metrics_df['Metric'] == metric_name]
+    if filtered_df.empty:
+        print(f"No data found for metric '{metric_name}'")
+        return
+    pivot_df = filtered_df.pivot_table(index='Round', columns='ClientID', values='Value', aggfunc='mean')
+
+    plt.figure(figsize=(10, 6))
+    for column in pivot_df.columns:
+        plt.plot(pivot_df.index, pivot_df[column], marker='o', label=f'Client {column}')
+
+    plt.title(title)
+    plt.xlabel('Federated Round')
+    plt.ylabel(metric_name.replace("_", " ").capitalize())
+    plt.legend(title='Client ID')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="FL client for anomaly detection")
+    parser.add_argument("--server_address", type=str, default="localhost:8080", help="Server address")
+    parser.add_argument("--client_id", type=int, default=0, help="Client ID")
+    parser.add_argument("--node-id", type=int, required=True, choices=range(0, 5), help="Node ID")
+    args = parser.parse_args()
+
+    num_clients = 5
+    
+    # Replace the data.csv with your own file
+    train_loaders, test_loaders = load_data("C:/Users/deyna/Desktop/anomaly-fl-main/data/feat.csv", num_clients=num_clients)
+
+    isolation_forest_model = IsolationForest(contamination=0.1)
+
+    clients = []
+    for client_id in range(num_clients):
+        client = AnomalyClient(isolation_forest_model, train_loaders[client_id], test_loaders[client_id], client_id).to_client()
+        clients.append(client)
+
+    client_ip = "localhost"
+    client_port = "8080"
+    server_address = f"{client_ip}:{client_port}"
+    print(f"Connecting to {server_address}")
+    fl.client.start_client(server_address=server_address, client=clients[args.client_id])
+
+    metrics_df = aggregate_metrics()
+    metrics_df.to_csv("metrics/metrics_aggregated.csv", index=False)
+    print("Metrics DataFrame saved to metrics/metrics_aggregated.csv")
+    print(metrics_df.head())
+
+    plot_metric_per_round(metrics_df, 'TRAIN_ACCURACY', 'Average Training Accuracy per Round', 'metrics/training_accuracy_per_round.png')
+
+
+if __name__ == "__main__":
+    main() '''  
+
+
+# with both models
+
+'''from anomaly import load_data
+
+disable_progress_bar()
 
 class AnomalyClient(fl.client.NumPyClient):
-    def __init__(self, model: LSTMNet, trainloader: DataLoader, testloader: DataLoader, client_id) -> None:
+    def __init__(self, isolation_forest_model, trainloader: DataLoader, testloader: DataLoader, client_id) -> None:
         super().__init__()
-        self.model = model
+        self.isolation_forest_model = isolation_forest_model
         self.trainloader = trainloader
         self.testloader = testloader
         self.client_id = client_id
         self.approx_round_number = 1
 
     def get_parameters(self, config=None) -> List[np.ndarray]:
-        self.model.train()
-        return [val.cpu().numpy() for _, val in self.model.state_dict().items()]
+        # Isolation Forest does not have parameters to get
+        return []
 
     def set_parameters(self, parameters: List[np.ndarray]) -> None:
-        self.model.train()
-        params_dict = zip(self.model.state_dict().keys(), parameters)
-        state_dict = {k: torch.tensor(v) for k, v in params_dict}
-        self.model.load_state_dict(state_dict, strict=True)
+        # Isolation Forest does not have parameters to set
+        pass
 
     def log_metric(self, metric_name, value):
         os.makedirs('metrics', exist_ok=True)
@@ -45,157 +341,72 @@ class AnomalyClient(fl.client.NumPyClient):
             writer.writerow([metric_name, value, self.client_id, self.approx_round_number])
 
     def fit(self, parameters: List[np.ndarray], config: Dict[str, str]) -> Tuple[List[np.ndarray], int, Dict]:
-        self.set_parameters(parameters)
-        training_loss, accuracy = train(self.model, self.trainloader, epochs=5, device=DEVICE)
+        # Train the Isolation Forest model
+        self.isolation_forest_model.fit(self.trainloader.dataset.tensors[0].numpy())
+        
+        # Evaluate the model on training data
+        training_labels = self.trainloader.dataset.tensors[1].numpy()
+        if_train_scores = self.isolation_forest_model.decision_function(self.trainloader.dataset.tensors[0].numpy())
+        training_preds = (if_train_scores < 0).astype(int)
 
+        training_loss = 1 - accuracy_score(training_labels, training_preds)
+        accuracy = accuracy_score(training_labels, training_preds)
+        precision = precision_score(training_labels, training_preds)
+        recall = recall_score(training_labels, training_preds)
+        f1 = f1_score(training_labels, training_preds)
+        
         self.log_metric("TRAIN_LOSS", training_loss)
         self.log_metric("TRAIN_ACCURACY", accuracy)
+        self.log_metric("TRAIN_PRECISION", precision)
+        self.log_metric("TRAIN_RECALL", recall)
+        self.log_metric("TRAIN_F1_SCORE", f1)
 
-        return self.get_parameters(), len(self.trainloader.dataset), {
+        return [], len(self.trainloader.dataset), {
             "training_loss": training_loss,
             "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1_score": f1
         }
 
-'''    def evaluate(self, parameters: List[np.ndarray], config: Dict[str, str]) -> Tuple[float, int, Dict]:
-        self.set_parameters(parameters)
-        testing_loss, accuracy = test(self.model, self.testloader, device=DEVICE)
+    def evaluate(self, parameters: List[np.ndarray], config: Dict[str, str]) -> Tuple[float, int, Dict]:
+        # Evaluate the model on test data
+        test_labels = self.testloader.dataset.tensors[1].numpy()
+        if_test_scores = self.isolation_forest_model.decision_function(self.testloader.dataset.tensors[0].numpy())
+        test_preds = (if_test_scores < 0).astype(int)
+
+        testing_loss = 1 - accuracy_score(test_labels, test_preds)
+        accuracy = accuracy_score(test_labels, test_preds)
+        precision = precision_score(test_labels, test_preds)
+        recall = recall_score(test_labels, test_preds)
+        f1 = f1_score(test_labels, test_preds)
+        
         self.approx_round_number += 1
-        return testing_loss, len(self.testloader.dataset), {"testing_loss": testing_loss, "accuracy": accuracy}'''
         
-def evaluate(self, parameters: List[np.ndarray], config: Dict[str, str]) -> Tuple[float, int, Dict]:
-    self.set_parameters(parameters)
-    testing_loss, accuracy, precision, recall, f1 = test(self.model, self.testloader, device=DEVICE)
-    self.approx_round_number += 1
-    
-    metrics = {
-        "testing_loss": testing_loss,
-        "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1_score": f1
-    }
-    
-    log_metrics(self.client_id, self.approx_round_number, metrics)
-    
-    return testing_loss, len(self.testloader.dataset), metrics
+        metrics = {
+            "testing_loss": testing_loss,
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1_score": f1
+        }
         
-def log_metrics(client_id, round_number, metrics):
-    os.makedirs('metrics', exist_ok=True)
-    filename = f"metrics/metrics_client_{client_id}.csv"
-    with open(filename, "a", newline='') as file:
-        writer = csv.writer(file)
-        for metric_name, value in metrics.items():
-            writer.writerow([metric_name, value, client_id, round_number])
-
-def train(model: LSTMNet, trainloader: DataLoader, epochs: int, device: torch.device) -> Tuple[float, float]:
-    model.train()
-    criterion = nn.BCELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
-    total_loss, correct = 0.0, 0
-    for epoch in range(epochs):
-        for inputs, labels in trainloader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            optimizer.zero_grad()
-            outputs = model(inputs).squeeze()
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-            predicted = (outputs > 0.5).float()
-            correct += (predicted == labels).sum().item()
-
-    accuracy = correct / len(trainloader.dataset)
-    return total_loss / len(trainloader), accuracy
-
-def test(model: LSTMNet, testloader: DataLoader, device: torch.device) -> Tuple[float, float, float, float, float]:
-    model.eval()
-    criterion = nn.BCELoss()
-
-    total_loss, correct = 0.0, 0
-    all_labels = []
-    all_predictions = []
-    
-    with torch.no_grad():
-        for inputs, labels in testloader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs).squeeze()
-            loss = criterion(outputs, labels)
-
-            total_loss += loss.item()
-            predicted = (outputs > 0.5).float()
-            correct += (predicted == labels).sum().item()
-            
-            all_labels.extend(labels.cpu().numpy())
-            all_predictions.extend(predicted.cpu().numpy())
-
-    accuracy = correct / len(testloader.dataset)
-    precision = precision_score(all_labels, all_predictions)
-    recall = recall_score(all_labels, all_predictions)
-    f1 = f1_score(all_labels, all_predictions)
-    
-    return total_loss / len(testloader), accuracy, precision, recall, f1
-
-    
-# def main() -> None:
-#     parser = argparse.ArgumentParser(description="FL client for anomaly detection")
-#     parser.add_argument("--server_address", type=str, default="localhost:8080", help="Server address")
-#     parser.add_argument("--client_id", type=int, default=0, help="Client ID")
-#     parser.add_argument("--node-id", type=int, required=True, choices=range(0, 5), help="Node ID")
-#     args = parser.parse_args()
-    
-#     # Load data for this client
-#     num_clients = 5 
-#     train_loaders, test_loaders = load_data("C:/Users/deyna/Desktop/anomaly-fl-main/data/feat.csv", num_clients=num_clients)
-
-#     # Initialize the model and client
-#     input_dim = len(train_loaders[0].dataset[0][0])
-#     hidden_dim = 32
-#     num_layers = 2
-#     model = LSTMNet(input_dim, hidden_dim, num_layers).to(DEVICE)
-#     client = AnomalyClient(model, train_loaders[args.client_id], test_loaders[args.client_id], args.client_id)
-
-#     # Start the FL client
-#     client_ip, client_port = args.server_address.split(":")
-#     client_port = int(client_port)
-#     client.log_metric("START", 1)
-#     fl.client.start_numpy_client(server_address=f"grpc://{client_ip}:{client_port}", client=client)
-
-# def main():
-#     parser = argparse.ArgumentParser(description="FL client for anomaly detection")
-#     parser.add_argument("--server_address", type=str, default="localhost:8080", help="Server address")
-#     parser.add_argument("--client_id", type=int, default=0, help="Client ID")
-#     parser.add_argument("--node-id", type=int, required=True, choices=range(0, 5), help="Node ID")
-#     args = parser.parse_args()
-    
-#     # Load data for this client
-#     num_clients = 5 
-#     train_loaders, test_loaders = load_data("C:/Users/deyna/Desktop/anomaly-fl-main/data/feat.csv", num_clients=num_clients)
-
-#     # Initialize the model and client
-#     input_dim = len(train_loaders[0].dataset[0][0])
-#     hidden_dim = 32
-#     num_layers = 2
-#     model = LSTMNet(input_dim, hidden_dim, num_layers).to(DEVICE)
-#     client = AnomalyClient(model, train_loaders[args.client_id], test_loaders[args.client_id], args.client_id)
-
-#     # Start the FL client
-#     client_ip = "localhost"  # Replace with actual client IP address if necessary
-#     client_port = "8080"      # Replace with actual client port if necessary
-    
-#     server_address = f"grpc://{args.server_address}"
-#     print(f"Connecting to {server_address}")
-#     client.log_metric("START", 1)
-
-#     # Initialize client and start connection
-#     fl.client.start_numpy_client(server_address=server_address, client=client)
+        self.log_metrics(metrics)
+        
+        return testing_loss, len(self.testloader.dataset), metrics
+        
+    def log_metrics(self, metrics):
+        os.makedirs('metrics', exist_ok=True)
+        filename = f"metrics/metrics_client_{self.client_id}.csv"
+        with open(filename, "a", newline='') as file:
+            writer = csv.writer(file)
+            for metric_name, value in metrics.items():
+                writer.writerow([metric_name, value, self.client_id, self.approx_round_number])
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="FL client for anomaly detection")
     parser.add_argument("--server_address", type=str, default="localhost:8080", help="Server address")
     parser.add_argument("--client_id", type=int, default=0, help="Client ID")
-    # Add --node-id argument 
     parser.add_argument("--node-id", type=int, required=True, choices=range(0, 5), help="Node ID")
     args = parser.parse_args()
     
@@ -203,12 +414,9 @@ def main() -> None:
     num_clients = 5 
     train_loaders, test_loaders = load_data("C:/Users/deyna/Desktop/anomaly-fl-main/data/feat.csv", num_clients=num_clients)
 
-    # Initialize the model and client
-    input_dim = len(train_loaders[0].dataset[0][0])
-    hidden_dim = 32
-    num_layers = 2
-    model = LSTMNet(input_dim, hidden_dim, num_layers).to(DEVICE)
-    client = AnomalyClient(model, train_loaders[args.client_id], test_loaders[args.client_id], args.client_id)
+    # Initialize the Isolation Forest model and client
+    isolation_forest_model = IsolationForest(contamination=0.1)
+    client = AnomalyClient(isolation_forest_model, train_loaders[args.client_id], test_loaders[args.client_id], args.client_id)
     
     if isinstance(client, fl.client.NumPyClient):
         client = client.to_client()
@@ -219,9 +427,7 @@ def main() -> None:
     
     server_address = f"{client_ip}:{client_port}"
     print(f"Connecting to {server_address}")
-    # client.log_metric("START", 1)
-    # Initialise client and start connection
-    fl.client.start_client(server_address = server_address, client=client)
+    fl.client.start_client(server_address=server_address, client=client)
 
 if __name__ == "__main__":
-    main()
+    main()'''
