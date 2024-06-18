@@ -1,6 +1,6 @@
 # Anomaly Detection in Federated Learning
 
-This repository pertains to Semester 1 of the Master of Applied IT, focusing on the Federated Learning project. The primary research inquiry revolves around exploring the influence of diverse data sources—such as numerical, textual, and image data—on the accuracy of federated learning models within the realm of anomaly detection. It aims to address the challenges presented by data heterogeneity in this context."
+This repository pertains to Semester 1 of the Master of Applied IT, focusing on the Federated Machine Learning project. The primary research revolves around exploring the influence of data heterogeneity in the context of anomaly detection."
 
 ## Instructions
 1. Install the dependancies in the `requirements.txt` file.
